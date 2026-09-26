@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Head-On Vortex Ring Collision</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #d9d9d9;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    #app { width: 100%; height: 100%; }
+    #overlay {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      background: rgba(255,255,255,0.82);
+      border: 1px solid rgba(0,0,0,0.18);
+      border-radius: 8px;
+      padding: 10px 12px;
+      max-width: 420px;
+      color: #111;
+      line-height: 1.35;
+      pointer-events: none;
+      font-size: 12px;
+    }
+    #overlay strong { display:block; margin-bottom: 4px; font-size: 14px; }
+    #reynolds {
+      position: absolute;
+      top: 10px;
+      right: 20px;
+      z-index: 10;
+      font-size: 30px;
+      color: #111;
+      letter-spacing: 0.08em;
+      user-select: none;
+      pointer-events: none;
+    }
+    .lil-gui.root { --width: 350px; z-index: 20; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="overlay">
+    <strong>Head-On Vortex Ring Collision</strong>
+    This version uses denser particles in the two parent smoke-ring tori. After the expanding collision reaches its outer rim, each particle-only secondary torus is born very small at its fixed center on the rim, then grows smoothly larger. This version also uses much denser particle populations.
+  </div>
+  <div id="reynolds">Re = <span id="reval">1750</span></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.168.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.168.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm';
+
+    const app = document.getElementById('app');
+    const reval = document.getElementById('reval');
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(47, window.innerWidth / window.innerHeight, 0.1, 300);
+    camera.position.set(0, 8, 24);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 1.0, 0);
+    controls.minDistance = 7;
+    controls.maxDistance = 60;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.94));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+    sun.position.set(7, 11, 10);
+    scene.add(sun);
+
+    const grid1 = new THREE.GridHelper(30, 15, 0x333333, 0x444444);
+    scene.add(grid1);
+    const grid2 = new THREE.GridHelper(12, 24, 0x555555, 0x777777);
+    grid2.position.y = 0.01;
+    scene.add(grid2);
+
+    const simGroup = new THREE.Group();
+    scene.add(simGroup);
+
+    // simple injector/nozzle markers to clarify the collision axis
+    const nozzleMatL = new THREE.MeshBasicMaterial({ color: 0xbb3333, transparent: true, opacity: 0.35 });
+    const nozzleMatR = new THREE.MeshBasicMaterial({ color: 0x3344dd, transparent: true, opacity: 0.35 });
+    const nozzleGeo = new THREE.CylinderGeometry(0.22, 0.22, 2.0, 20);
+    const nozzleL = new THREE.Mesh(nozzleGeo, nozzleMatL);
+    nozzleL.rotation.z = Math.PI / 2;
+    nozzleL.position.set(-12.0, 0.0, 0.0);
+    scene.add(nozzleL);
+    const nozzleR = new THREE.Mesh(nozzleGeo, nozzleMatR);
+    nozzleR.rotation.z = Math.PI / 2;
+    nozzleR.position.set(12.0, 0.0, 0.0);
+    scene.add(nozzleR);
+
+    const params = {
+      outerInnerRatio: 2.1,
+      parentOuterRadius: 1.10,
+      collisionSpeed: 2.0,
+      circulationSpeed: 1.45,
+      membraneRadius: 3.9,
+      membraneGrowthSpeed: 2.0,
+      instabilityCount: 18,
+      instabilitySize: 0.5,
+      instabilityGrowth: 1.0,
+      rimPropagation: 1.0,
+      transitionFluidity: 1.0,
+      rimFeedStrength: 1.0,
+      particleDensity: 12000,
+      loop: true,
+      pause: false,
+      reset: () => resetSimulation(),
+    };
+
+    let leftParent, rightParent;
+    let membrane, membraneHalo, membraneCore;
+    let instabilities = [];
+
+    const sim = {
+      phase: 'approach',
+      time: 0,
+      phaseTime: 0,
+      startX: 10.2,
+      hold: 5.0,
+      holdTimer: 0,
+      smallTorusGrowth: 0,
+    };
+
+    function computeParentGeom() {
+      const innerRadius = params.parentOuterRadius / Math.max(params.outerInnerRatio, 1.02);
+      const R = (params.parentOuterRadius + innerRadius) * 0.5;
+      const r = Math.max(0.04, (params.parentOuterRadius - innerRadius) * 0.5);
+      return { innerRadius, R, r };
+    }
+
+    function makeParticleTorus(colorHex) {
+      const { R, r } = computeParentGeom();
+      const count = Math.floor(params.particleDensity);
+      const positions = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+      const seeds = new Float32Array(count * 3);
+      const color = new THREE.Color(colorHex);
+
+      for (let i = 0; i < count; i++) {
+        const u = Math.random() * Math.PI * 2;           // around big ring
+        const theta = Math.random() * Math.PI * 2;       // around tube cross-section
+        const rho = Math.sqrt(Math.random()) * r * 0.98; // fill the tube volume, not just the surface
+        seeds[i * 3] = u;
+        seeds[i * 3 + 1] = theta;
+        seeds[i * 3 + 2] = rho;
+        const RR = R + rho * Math.cos(theta);
+        positions[i * 3] = RR * Math.cos(u);
+        positions[i * 3 + 1] = RR * Math.sin(u);
+        positions[i * 3 + 2] = rho * Math.sin(theta);
+        colors[i * 3] = color.r;
+        colors[i * 3 + 1] = color.g;
+        colors[i * 3 + 2] = color.b;
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geo.userData.seeds = seeds;
+
+      const ptsMat = new THREE.PointsMaterial({
+        size: 0.042,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false,
+      });
+
+      const group = new THREE.Group();
+      const pts = new THREE.Points(geo, ptsMat);
+      const shell = new THREE.Mesh(
+        new THREE.TorusGeometry(R, r, 18, 72),
+        new THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity: 0.18, wireframe: false })
+      );
+      group.add(shell);
+      group.add(pts);
+      group.rotation.y = Math.PI / 2; // parent torus openings point directly toward each other along x
+      group.userData.points = pts;
+      group.userData.shell = shell;
+      return group;
+    }
+
+    // No external trail particles: the initial particles are confined to the two parent tori only.
+
+    function makeMembrane() {
+      const count = 9000;
+      const positions = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+      const seeds = new Float32Array(count * 2);
+      for (let i = 0; i < count; i++) {
+        const radiusSeed = Math.sqrt(Math.random());
+        const a = Math.random() * Math.PI * 2;
+        seeds[i * 2] = radiusSeed;
+        seeds[i * 2 + 1] = a;
+        positions[i * 3] = (Math.random() - 0.5) * 0.02;
+        positions[i * 3 + 1] = radiusSeed * Math.cos(a);
+        positions[i * 3 + 2] = radiusSeed * Math.sin(a);
+        const blue = Math.random() > 0.5;
+        colors[i * 3] = blue ? 0.18 : 0.75;
+        colors[i * 3 + 1] = blue ? 0.25 : 0.16;
+        colors[i * 3 + 2] = blue ? 0.86 : 0.16;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geo.userData.seeds = seeds;
+      const mat = new THREE.PointsMaterial({ size: 0.03, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false });
+      const pts = new THREE.Points(geo, mat);
+      pts.visible = false;
+      return pts;
+    }
+
+    function makeMembraneHalo() {
+      const geo = new THREE.RingGeometry(0.95, 1.0, 120);
+      const mat = new THREE.MeshBasicMaterial({ color: 0x2a2a2a, transparent: true, opacity: 0.45, side: THREE.DoubleSide });
+      const ring = new THREE.Mesh(geo, mat);
+      ring.rotation.y = Math.PI / 2;
+      ring.visible = false;
+      return ring;
+    }
+
+    function makeMembraneCore() {
+      const geo = new THREE.CircleGeometry(1, 80);
+      const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.06, side: THREE.DoubleSide });
+      const core = new THREE.Mesh(geo, mat);
+      core.rotation.y = Math.PI / 2;
+      core.visible = false;
+      return core;
+    }
+
+    function makeInstability(index, total) {
+      const a = index / total * Math.PI * 2;
+      const group = new THREE.Group();
+      const carrier = new THREE.Group();
+      group.add(carrier);
+
+      const color = index % 2 === 0 ? 0xbb3333 : 0x3344dd;
+      const pCount = 1200;
+      const pos = new Float32Array(pCount * 3);
+      const col = new Float32Array(pCount * 3);
+      const seeds = new Float32Array(pCount * 2);
+      const c = new THREE.Color(color);
+      for (let i = 0; i < pCount; i++) {
+        const u = Math.random() * Math.PI * 2;
+        const v = Math.random() * Math.PI * 2;
+        seeds[i * 2] = u;
+        seeds[i * 2 + 1] = v;
+        const RR = 0.56 + 0.12 * Math.cos(v);
+        pos[i * 3] = 0.12 * Math.sin(v);
+        pos[i * 3 + 1] = RR * Math.cos(u);
+        pos[i * 3 + 2] = RR * Math.sin(u);
+        col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      geo.userData.seeds = seeds;
+      const pts = new THREE.Points(geo, new THREE.PointsMaterial({ size: 0.024, vertexColors: true, transparent: true, opacity: 0.88, depthWrite: false }));
+      carrier.add(pts);
+
+      group.visible = false;
+      group.userData = { angle: a, carrier, pts, colorSign: index % 2 === 0 ? 1 : -1 };
+      return group;
+    }
+
+    function updateParentTorus(points, t, sign) {
+      const { R, r } = computeParentGeom();
+      const arr = points.userData.points.geometry.attributes.position.array;
+      const seeds = points.userData.points.geometry.userData.seeds;
+      for (let i = 0; i < seeds.length / 3; i++) {
+        const u0 = seeds[i * 3];
+        const theta0 = seeds[i * 3 + 1];
+        const rho = seeds[i * 3 + 2];
+        // Smoke ring behavior: the torus translates as a body, while the internal particles circulate within the tube.
+        const u = u0 + 0.02 * Math.sin(t * 0.7 + u0 * 2.0);
+        const theta = theta0 + t * params.circulationSpeed * sign + 0.08 * Math.sin(2.0 * u0 + t * 1.7);
+        const RR = R + rho * Math.cos(theta);
+        arr[i * 3] = RR * Math.cos(u);
+        arr[i * 3 + 1] = RR * Math.sin(u);
+        arr[i * 3 + 2] = rho * Math.sin(theta);
+      }
+      points.userData.points.geometry.attributes.position.needsUpdate = true;
+    }
+
+    function updateMembrane(t, growth, currentRadius) {
+      const arr = membrane.geometry.attributes.position.array;
+      const seeds = membrane.geometry.userData.seeds;
+
+      const fluid = params.transitionFluidity;
+      const edgePulse = params.rimFeedStrength;
+
+      for (let i = 0; i < seeds.length / 2; i++) {
+        const radialSeed = seeds[i * 2];
+        const a0 = seeds[i * 2 + 1];
+
+        // Advect particles outward through the disk instead of simply scaling the disk.
+        const advect = radialSeed * currentRadius;
+        const radialWave =
+          0.06 * fluid * Math.sin(t * 2.0 - radialSeed * 7.0) +
+          0.03 * fluid * Math.sin(t * 4.5 + a0 * 6.0);
+
+        const rs = Math.max(0, advect + radialWave * currentRadius * 0.10);
+
+        // Gentle azimuthal swirl increases toward the rim.
+        const swirl = 0.18 * fluid * radialSeed * Math.sin(t * 1.25 + radialSeed * 3.0);
+        const a = a0 + swirl;
+
+        // A travelling ripple moves outward and becomes stronger near the rim.
+        const ripple =
+          0.035 * fluid *
+          Math.sin(10 * a - t * 6.0 + radialSeed * 5.0) *
+          Math.pow(radialSeed, 2.4) *
+          Math.min(1, growth * 1.25);
+
+        // Slight sheet thickness, strongest near the collision rim.
+        const rimBoost = Math.pow(radialSeed, 4.0);
+        const thickness =
+          0.010 * Math.sin(t * 4.0 + rs * 2.2) +
+          0.11 * edgePulse * rimBoost * Math.sin(t * 5.0 + a * 7.0) * growth;
+
+        arr[i * 3] = thickness;
+        arr[i * 3 + 1] = (rs + ripple) * Math.cos(a);
+        arr[i * 3 + 2] = (rs + ripple) * Math.sin(a);
+      }
+
+      membrane.geometry.attributes.position.needsUpdate = true;
+      membrane.visible = growth > 0.001;
+      membrane.material.opacity = 0.16 + 0.62 * growth;
+      membraneHalo.visible = growth > 0.001;
+      membraneCore.visible = growth > 0.001;
+      membraneHalo.scale.setScalar(currentRadius);
+      membraneCore.scale.setScalar(currentRadius * 0.94);
+      membraneHalo.material.opacity = 0.08 + 0.24 * growth;
+      membraneCore.material.opacity = 0.02 + 0.06 * growth;
+    }
+
+    function updateInstability(obj, t, emergence, currentRadius, sizeGrowth = emergence) {
+      const a = obj.userData.angle;
+
+      // Put the CENTER of every small torus exactly on the expanding ring.
+      const cy = currentRadius * Math.cos(a);
+      const cz = currentRadius * Math.sin(a);
+      obj.position.set(0, cy, cz);
+
+      // Orient each small torus so its central axis follows the tangent of the large ring.
+      // This makes the little torus sit "on" the rim rather than facing the center.
+      const tangent = new THREE.Vector3(0, -Math.sin(a), Math.cos(a)).normalize();
+      const q = new THREE.Quaternion();
+      q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tangent);
+      obj.quaternion.copy(q);
+
+      obj.visible = emergence > 0.01;
+
+      // The tori first appear tiny when the expanding collision reaches the rim.
+      // They then continue growing outward from their fixed center points.
+      const appear = THREE.MathUtils.clamp(emergence, 0, 1);
+      const growth = THREE.MathUtils.clamp(sizeGrowth, 0, 1);
+      const appearEase = appear * appear * (3.0 - 2.0 * appear);
+      const growthEase = growth * growth * (3.0 - 2.0 * growth);
+
+      // Automatically stop growing when neighboring tori touch.
+      // Neighbor centers sit on the same expanding ring, so their separation
+      // is the chord length between adjacent points on that ring.
+      const neighborDistance =
+        2 * currentRadius * Math.sin(Math.PI / Math.max(2, params.instabilityCount));
+
+      // Small torus local outer radius = major radius 0.56 + tube radius 0.12.
+      const localOuterRadius = 0.68;
+
+      // Two equal neighboring tori meet when:
+      // 2 * localOuterRadius * scale = neighborDistance.
+      const contactScale = (neighborDistance / (2 * localOuterRadius)) * 0.985;
+
+      const minScale = 0.04;
+      const scale = appearEase *
+                    THREE.MathUtils.lerp(minScale, contactScale, growthEase);
+
+      obj.scale.setScalar(scale);
+
+      // Keep the torus body itself centered. Only the internal flow rotates.
+      obj.userData.carrier.position.set(0, 0, 0);
+      obj.userData.carrier.rotation.z += 0.018 * obj.userData.colorSign;
+
+      const arr = obj.userData.pts.geometry.attributes.position.array;
+      const seeds = obj.userData.pts.geometry.userData.seeds;
+      for (let i = 0; i < seeds.length / 2; i++) {
+        const u0 = seeds[i * 2];
+        const v0 = seeds[i * 2 + 1];
+
+        // Flow around the tube of each small torus.
+        // The phase offset gives the impression that fluid arriving at the rim curls into each vortex.
+        const feedPhase = Math.sin(t * 1.6 + a * 4.0);
+        const u = u0 + 0.025 * Math.sin(t * 1.2 + u0 * 3.0 + a);
+        const v = v0 + t * (1.9 + 0.35 * params.rimFeedStrength) * obj.userData.colorSign
+                  + 0.12 * feedPhase;
+
+        const breathing = 1.0 + 0.035 * Math.sin(t * 2.4 + a * 6.0);
+        const RR = 0.56 + (0.12 * breathing) * Math.cos(v);
+
+        arr[i * 3] = RR * Math.cos(u);
+        arr[i * 3 + 1] = RR * Math.sin(u);
+        arr[i * 3 + 2] = (0.12 * breathing) * Math.sin(v);
+      }
+      obj.userData.pts.geometry.attributes.position.needsUpdate = true;
+    }
+
+    function rebuildScene() {
+      simGroup.clear();
+      instabilities = [];
+
+      leftParent = makeParticleTorus(0xbb3333);
+      rightParent = makeParticleTorus(0x3344dd);
+      membrane = makeMembrane();
+      membraneHalo = makeMembraneHalo();
+      membraneCore = makeMembraneCore();
+
+      leftParent.position.x = -sim.startX;
+      rightParent.position.x = sim.startX;
+
+      simGroup.add(leftParent, rightParent, membrane, membraneHalo, membraneCore);
+      for (let i = 0; i < params.instabilityCount; i++) {
+        const it = makeInstability(i, params.instabilityCount);
+        instabilities.push(it);
+        simGroup.add(it);
+      }
+    }
+
+    function resetSimulation() {
+      sim.phase = 'approach';
+      sim.time = 0;
+      sim.phaseTime = 0;
+      sim.holdTimer = 0;
+      sim.smallTorusGrowth = 0;
+      reval.textContent = Math.round(900 + params.collisionSpeed * 425);
+      rebuildScene();
+    }
+
+    function updateSimulation(dt) {
+      if (!params.pause) {
+        sim.time += dt;
+        sim.phaseTime += dt;
+      }
+
+      updateParentTorus(leftParent, sim.time, +1);
+      updateParentTorus(rightParent, sim.time, -1);
+
+      if (sim.phase === 'approach') {
+        const x = Math.max(0, sim.startX - params.collisionSpeed * sim.phaseTime);
+        leftParent.position.x = -x;
+        rightParent.position.x = x;
+        leftParent.scale.set(1,1,1);
+        rightParent.scale.set(1,1,1);
+        leftParent.userData.points.material.opacity = 0.9;
+        rightParent.userData.points.material.opacity = 0.9;
+        leftParent.userData.shell.material.opacity = 0.18;
+        rightParent.userData.shell.material.opacity = 0.18;
+        membrane.visible = membraneHalo.visible = membraneCore.visible = false;
+        instabilities.forEach(o => o.visible = false);
+
+        if (x <= 0.02) {
+          sim.phase = 'membrane';
+          sim.phaseTime = 0;
+          leftParent.position.x = 0;
+          rightParent.position.x = 0;
+        }
+      } else if (sim.phase === 'membrane') {
+        const growthT = THREE.MathUtils.clamp(sim.phaseTime * params.membraneGrowthSpeed / Math.max(0.2, params.membraneRadius), 0, 1);
+        const currentRadius = THREE.MathUtils.lerp(params.parentOuterRadius * 0.9, params.membraneRadius, growthT);
+
+        // The secondary tori first appear only near the outer boundary.
+        const lobeT = THREE.MathUtils.clamp((growthT - 0.82) / 0.18, 0, 1);
+
+        // Keep a continuous growth value so there is no sudden size jump at the phase transition.
+        if (!params.pause && lobeT > 0) {
+          sim.smallTorusGrowth = Math.min(1, sim.smallTorusGrowth + dt * 0.10 * params.instabilityGrowth);
+        }
+        const birthGrowth = sim.smallTorusGrowth;
+
+        // Keep the parent-ring particles visible longer so their motion visually feeds the sheet.
+        const parentFade = THREE.MathUtils.smoothstep(growthT, 0.22, 1.0);
+        leftParent.userData.points.material.opacity = 0.9 * (1 - parentFade);
+        rightParent.userData.points.material.opacity = 0.9 * (1 - parentFade);
+        leftParent.userData.shell.material.opacity = 0.18 * (1 - parentFade);
+        rightParent.userData.shell.material.opacity = 0.18 * (1 - parentFade);
+
+        leftParent.position.set(0,0,0);
+        rightParent.position.set(0,0,0);
+
+        // Compress axially and spread radially in one continuous deformation.
+        const deform = growthT * growthT * (3.0 - 2.0 * growthT);
+        leftParent.scale.set(
+          THREE.MathUtils.lerp(1.0, 0.18, deform),
+          THREE.MathUtils.lerp(1.0, 2.15, deform),
+          THREE.MathUtils.lerp(1.0, 2.15, deform)
+        );
+        rightParent.scale.set(
+          THREE.MathUtils.lerp(1.0, 0.18, deform),
+          THREE.MathUtils.lerp(1.0, 2.15, deform),
+          THREE.MathUtils.lerp(1.0, 2.15, deform)
+        );
+
+        updateMembrane(sim.time, growthT, currentRadius);
+        instabilities.forEach(o => updateInstability(o, sim.time, lobeT, currentRadius, birthGrowth));
+
+        if (growthT >= 1 && lobeT >= 1) {
+          sim.phase = 'hold';
+          sim.phaseTime = 0;
+        }
+      } else if (sim.phase === 'hold') {
+        leftParent.userData.points.material.opacity = 0;
+        rightParent.userData.points.material.opacity = 0;
+        leftParent.userData.shell.material.opacity = 0;
+        rightParent.userData.shell.material.opacity = 0;
+        updateMembrane(sim.time, 1, params.membraneRadius);
+        membrane.rotation.x += dt * 0.08;
+        membraneHalo.rotation.x += dt * 0.08;
+        membraneCore.rotation.x += dt * 0.08;
+        if (!params.pause) {
+          sim.smallTorusGrowth = Math.min(1, sim.smallTorusGrowth + dt * 0.28 * params.instabilityGrowth);
+        }
+        instabilities.forEach(o =>
+          updateInstability(o, sim.time, 1, params.membraneRadius, sim.smallTorusGrowth)
+        );
+        sim.holdTimer += dt;
+        if (params.loop && sim.holdTimer >= sim.hold) resetSimulation();
+      }
+    }
+
+    const gui = new GUI({ title: 'Controls' });
+    gui.add(params, 'outerInnerRatio', 1.05, 5.5, 0.01).name('Outer / Inner Ratio').onFinishChange(resetSimulation);
+    gui.add(params, 'parentOuterRadius', 0.55, 2.0, 0.01).name('Parent Outer Radius').onFinishChange(resetSimulation);
+    gui.add(params, 'collisionSpeed', 0.5, 4.0, 0.01).name('Collision Speed').onFinishChange(() => reval.textContent = Math.round(900 + params.collisionSpeed * 425));
+    gui.add(params, 'circulationSpeed', 0.2, 3.0, 0.01).name('Tube Circulation Speed');
+    gui.add(params, 'membraneRadius', 1.8, 6.0, 0.01).name('Membrane Radius').onFinishChange(resetSimulation);
+    gui.add(params, 'membraneGrowthSpeed', 0.5, 4.0, 0.01).name('Membrane Growth Speed');
+    gui.add(params, 'instabilityCount', 4, 32, 1).name('Instability Count').onFinishChange(resetSimulation);
+    gui.add(params, 'instabilitySize', 0.2, 2.0, 0.01).name('Instability Size');
+    gui.add(params, 'instabilityGrowth', 0.2, 3.0, 0.01).name('Instability Growth');
+    gui.add(params, 'rimPropagation', 0.4, 2.5, 0.01).name('Rim Propagation');
+    gui.add(params, 'transitionFluidity', 0.2, 2.5, 0.01).name('Transition Fluidity');
+    gui.add(params, 'rimFeedStrength', 0.2, 2.5, 0.01).name('Rim Feed Strength');
+    gui.add(params, 'particleDensity', 2000, 30000, 500).name('Particle Density').onFinishChange(resetSimulation);
+    gui.add(params, 'loop').name('Loop');
+    gui.add(params, 'pause').name('Pause');
+    gui.add(params, 'reset').name('Reset Now');
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    window.addEventListener('error', (event) => {
+      document.getElementById('overlay').innerHTML += `<br><br><span style="color:#a00"><b>Runtime error:</b> ${event.message}</span>`;
+    });
+
+    const clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.033);
+      updateSimulation(dt);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    resetSimulation();
+    animate();
+  </script>
+</body>
+</html>
